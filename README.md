@@ -5,6 +5,19 @@
 
 A FastMCP-powered bridge exposing `arduino-cli` functionality via the Model Context Protocol (MCP). Manage sketches, boards, libraries, files, plus generate WireViz schematics from YAML or natural language.
 
+## Fork Scope (v1.0)
+
+This fork targets autonomous experiment runs for ESP32: send START/STOP/EXPORT over serial, collect SD logs, run analysis, and upload artifacts, all via a single `pipeline.run_and_collect` tool. The documents in `docs/` define the requirements and tool contracts; implementation is in progress.
+
+## Docs
+
+- `docs/README.md` - documentation index
+- `docs/requirements-v1.md` - v1.0 requirements and constraints
+- `docs/pipeline-run-and-collect.md` - pipeline tool specification
+- `docs/artifacts.md` - artifact layout and manifest fields
+- `docs/serial-export.md` - serial command and export protocol
+- `docs/fork-todo.md` - implementation plan and minimum-diff order
+
 ## Requirements
 
 - **Python ≥3.10**

@@ -79,6 +79,7 @@ import re
 import shutil  # Used for finding executable and file operations
 import subprocess
 import threading
+import time
 import sys # Added for exit calls and platform detection
 import openai  # For GPT-4.1 API calls
 
@@ -148,6 +149,9 @@ except ImportError:
 USER_HOME: Path = Path.home()
 SKETCHES_BASE_DIR: Path = USER_HOME / "Documents" / "Arduino_MCP_Sketches"
 BUILD_TEMP_DIR: Path = SKETCHES_BASE_DIR / "_build_temp"
+ARTIFACTS_BASE_DIR: Path = Path(
+    os.environ.get("MCP_ARTIFACTS_DIR", str(Path.cwd() / "artifacts"))
+).expanduser()
 FUZZY_SEARCH_THRESHOLD: int = 75  # Minimum score (0-100) for fuzzy matches
 DEFAULT_FQBN: str = "arduino:avr:uno" # Default FQBN for write_file auto-compile
 SERIAL_LOG_DIR: Path = SKETCHES_BASE_DIR / "_serial_logs"
@@ -805,6 +809,115 @@ async def _resume_monitors(states: List[SerialMonitorState]) -> List[str]:
     return restarted
 # --- End Serial Monitor Helpers ---
 
+# --- Serial Write Helpers ---
+def _load_pyserial():
+    try:
+        import serial  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "pyserial is required for serial write/export. Install with: pip install pyserial"
+        ) from e
+    return serial
+
+def _coerce_serial_payload(data: Union[str, bytes], append_newline: bool) -> bytes:
+    payload = data if isinstance(data, bytes) else str(data).encode("utf-8")
+    if append_newline and not payload.endswith(b"\n"):
+        payload += b"\n"
+    return payload
+
+def _sync_serial_write(
+    port: str,
+    baud: int,
+    data: Union[str, bytes],
+    append_newline: bool,
+    timeout_sec: float = 2.0,
+) -> int:
+    serial = _load_pyserial()
+    payload = _coerce_serial_payload(data, append_newline)
+    with serial.Serial(
+        port=port,
+        baudrate=baud,
+        timeout=timeout_sec,
+        write_timeout=timeout_sec,
+    ) as ser:
+        bytes_written = ser.write(payload)
+        ser.flush()
+    return bytes_written
+
+def _sync_serial_export_collect(
+    port: str,
+    baud: int,
+    export_cmd: str,
+    timeout_sec: float,
+    append_newline: bool = True,
+) -> Tuple[bytes, str]:
+    serial = _load_pyserial()
+    payload = _coerce_serial_payload(export_cmd, append_newline)
+    raw_lines: List[str] = []
+    csv_lines: List[str] = []
+    csv_bytes: bytearray = bytearray()
+    size_expected: Optional[int] = None
+    capture_all = True
+    capturing = False
+    start_time = time.monotonic()
+
+    with serial.Serial(
+        port=port,
+        baudrate=baud,
+        timeout=0.5,
+        write_timeout=2.0,
+    ) as ser:
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        ser.write(payload)
+        ser.flush()
+
+        while time.monotonic() - start_time < timeout_sec:
+            if size_expected is not None:
+                remaining = size_expected - len(csv_bytes)
+                if remaining <= 0:
+                    break
+                chunk = ser.read(min(4096, remaining))
+                if chunk:
+                    csv_bytes.extend(chunk)
+                continue
+
+            line_bytes = ser.readline()
+            if not line_bytes:
+                continue
+            line_text = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+            raw_lines.append(line_text)
+
+            if line_text == "BEGIN":
+                capture_all = False
+                capturing = True
+                csv_lines = []
+                continue
+            if line_text == "END" and capturing:
+                break
+            if line_text.startswith("SIZE="):
+                try:
+                    size_expected = int(line_text.split("=", 1)[1])
+                except ValueError:
+                    raw_lines.append(f"# Invalid SIZE header: {line_text}")
+                    size_expected = None
+                continue
+
+            if capture_all or capturing:
+                csv_lines.append(line_text)
+
+    if size_expected is not None and csv_bytes:
+        payload_bytes = bytes(csv_bytes)
+    elif csv_lines:
+        payload_bytes = ("\n".join(csv_lines) + "\n").encode("utf-8")
+    else:
+        payload_bytes = b""
+
+    return payload_bytes, "\n".join(raw_lines)
+# --- End Serial Write Helpers ---
+
 # --- Synchronous File I/O Helpers (Run in Executor Thread) ---
 # These helpers ensure blocking file I/O doesn't block the asyncio event loop.
 
@@ -852,6 +965,29 @@ def _sync_read_binary_file(filepath: Path) -> bytes:
         log.error(f"Sync binary read failed for {filepath}: {e}")
         raise
 
+def _sync_write_binary_file(filepath: Path, content: bytes):
+    """Synchronously writes binary content to a file."""
+    log.debug(f"Executing sync binary write to: {filepath}")
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_bytes(content)
+        log.debug(f"Sync binary write successful: {filepath} ({len(content)} bytes)")
+    except OSError as e:
+        log.error(f"Sync binary write failed for {filepath}: {e}")
+        raise
+
+def _sync_append_text(filepath: Path, content: str, encoding: str = "utf-8"):
+    """Synchronously appends text to a file."""
+    log.debug(f"Executing sync append to: {filepath}")
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with filepath.open("a", encoding=encoding) as handle:
+            handle.write(content)
+        log.debug(f"Sync append successful: {filepath}")
+    except OSError as e:
+        log.error(f"Sync append failed for {filepath}: {e}")
+        raise
+
 def _sync_rename_file(old_path: Path, new_path: Path):
     """Synchronously renames/moves a file or directory."""
     log.debug(f"Executing sync rename from {old_path} to {new_path}")
@@ -882,6 +1018,18 @@ def _sync_list_dir(dir_path: Path) -> List[str]:
         raise
     except OSError as e:
         log.error(f"Sync listdir failed for {dir_path}: {e}")
+        raise
+
+def _sync_collect_files(dir_path: Path) -> List[Path]:
+    """Synchronously collects file paths under a directory."""
+    log.debug(f"Executing sync file collection for: {dir_path}")
+    try:
+        return [item for item in dir_path.rglob("*") if item.is_file()]
+    except FileNotFoundError:
+        log.warning(f"Sync file collection failed: Directory not found at {dir_path}")
+        raise
+    except OSError as e:
+        log.error(f"Sync file collection failed for {dir_path}: {e}")
         raise
 
 def _sync_mkdir(dir_path: Path):
@@ -1015,6 +1163,80 @@ async def _resolve_and_validate_path(
 
     return resolved_path
 # --- End Path Validation Helper ---
+
+# --- Artifact Helpers ---
+def _validate_run_id(run_id: str) -> str:
+    if not run_id:
+        raise ValueError("run_id is required.")
+    if any(c in run_id for c in ["/", "\\"]) or ".." in run_id:
+        raise ValueError("run_id cannot contain path separators or '..'.")
+    sanitized = _sanitize_filename(run_id)
+    if sanitized != run_id:
+        raise ValueError("run_id must be ASCII letters, numbers, underscore, dash, or dot only.")
+    return run_id
+
+async def _ensure_artifacts_base_dir() -> Path:
+    base_dir = ARTIFACTS_BASE_DIR.resolve(strict=False)
+    await _async_file_op(_sync_mkdir, base_dir)
+    return base_dir
+
+async def _generate_run_id() -> str:
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = await _ensure_artifacts_base_dir()
+    try:
+        entries = await _async_file_op(_sync_list_dir, base_dir)
+    except FileNotFoundError:
+        entries = []
+
+    prefix = f"{timestamp}_run"
+    existing_indices: List[int] = []
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if len(suffix) != 3 or not suffix.isdigit():
+            continue
+        try:
+            existing_indices.append(int(suffix))
+        except ValueError:
+            continue
+
+    next_index = max(existing_indices, default=0) + 1
+    return f"{prefix}{next_index:03d}"
+
+async def _create_artifact_dir(run_id: str) -> Path:
+    safe_run_id = _validate_run_id(run_id)
+    base_dir = await _ensure_artifacts_base_dir()
+    run_dir = (base_dir / safe_run_id).resolve(strict=False)
+    try:
+        if not run_dir.is_relative_to(base_dir):
+            raise PermissionError(f"Artifact dir must be within {base_dir}")
+    except AttributeError:
+        common = os.path.commonpath([str(base_dir), str(run_dir)])
+        if common != str(base_dir):
+            raise PermissionError(f"Artifact dir must be within {base_dir}")
+
+    await _async_file_op(_sync_mkdir, run_dir)
+    await _async_file_op(_sync_mkdir, run_dir / "sd")
+    await _async_file_op(_sync_mkdir, run_dir / "analysis")
+    return run_dir
+
+async def _append_control_log(log_path: Path, message: str) -> None:
+    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+    line = f"{timestamp} {message}"
+    await _async_file_op(_sync_append_line_with_rotation, log_path, line, 0, 0)
+
+def _tail_text(value: str, max_chars: int = 2000) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[-max_chars:]
+
+def _expand_placeholders(value: str, run_id: str, artifact_dir: Path) -> str:
+    return (
+        value.replace("{run_id}", run_id)
+        .replace("{artifact_dir}", str(artifact_dir))
+    )
+# --- End Artifact Helpers ---
 
 # --- Compile Execution & Output Parsing Helper ---
 def _parse_compile_output(stdout_str: str, stderr_str: str) -> str:
@@ -1178,6 +1400,34 @@ async def _open_file_in_default_app(filepath: Path):
         cmd_str = ' '.join(command) if command else "System command"
         log.warning(f"Failed to open file '{filepath_str}' using '{cmd_str}'. Error: {type(e).__name__}: {e}")
 # --- End File Opening Helper ---
+
+async def _run_python_script(
+    script_path: Path,
+    args: List[str],
+    timeout_sec: float,
+    cwd: Optional[Path] = None,
+) -> Tuple[int, str, str]:
+    cmd = [sys.executable, str(script_path), *args]
+    log.debug(f"Running analysis script: {' '.join(cmd)}")
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError as e:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        raise TimeoutError(f"Analysis script timed out after {timeout_sec}s") from e
+
+    stdout_str = stdout.decode(errors="replace").strip() if stdout else ""
+    stderr_str = stderr.decode(errors="replace").strip() if stderr else ""
+    return_code = process.returncode if process.returncode is not None else -1
+    return return_code, stdout_str, stderr_str
 
 
 # ==============================================================================
@@ -1474,7 +1724,7 @@ async def serial_monitor_start(
         if log_file:
             log_path = await _resolve_and_validate_path(
                 log_file,
-                allowed_bases=[USER_HOME],
+                allowed_bases=[USER_HOME, ARTIFACTS_BASE_DIR],
                 check_existence=False
             )
         else:
@@ -1587,6 +1837,60 @@ async def serial_monitor_stop(
         return f"Serial monitor stopped: {monitor_id}"
     asyncio.create_task(stop_coro)
     return f"Serial monitor stopping (async): {monitor_id}"
+
+
+@mcp.tool()
+async def serial_write(
+    port: str,
+    baud: int = SERIAL_DEFAULT_BAUD,
+    data: Union[str, bytes] = "",
+    append_newline: bool = True,
+) -> Dict[str, Any]:
+    """
+    Sends a command to a serial port.
+
+    Args:
+        port: Serial port address (e.g., COM3, /dev/ttyACM0).
+        baud: Baud rate for the serial connection (default 115200).
+        data: String or bytes payload to send.
+        append_newline: Append a newline when True.
+
+    Returns:
+        Dict with ok and bytes_written.
+    """
+    log.info(f"Tool Call: serial_write(port='{port}', baud={baud}, append_newline={append_newline})")
+    if not port:
+        raise ValueError("Serial port must be specified.")
+    if baud <= 0:
+        raise ValueError("Baud rate must be a positive integer.")
+    if data is None:
+        raise ValueError("data is required.")
+
+    try:
+        bytes_written = await _async_file_op(
+            _sync_serial_write, port, baud, data, append_newline
+        )
+    except Exception as e:
+        log.error(f"Serial write failed on {port}: {e}")
+        raise Exception(f"Serial write failed: {e}") from e
+
+    return {"ok": True, "bytes_written": bytes_written}
+
+
+@mcp.tool()
+async def serial_request_export(
+    run_id: str,
+    port: str,
+    baud: int = SERIAL_DEFAULT_BAUD,
+) -> Dict[str, Any]:
+    """
+    Sends EXPORT command for a run_id and returns a hint for next action.
+    """
+    log.info(f"Tool Call: serial_request_export(run_id='{run_id}', port='{port}', baud={baud})")
+    safe_run_id = _validate_run_id(run_id)
+    export_cmd = f"EXPORT run_id={safe_run_id}"
+    result = await serial_write(port=port, baud=baud, data=export_cmd, append_newline=True)
+    return {"ok": result.get("ok", True), "hint": "monitor_read_next"}
 
 
 @mcp.tool()
@@ -1790,6 +2094,525 @@ async def upload_sketch(
                 log.warning(f"Failed to resume serial monitor after upload error: {resume_err}")
         # Re-raise the specific error for better feedback
         raise Exception(f"Upload failed for sketch '{sketch_name}': {e}") from e
+
+
+@mcp.tool()
+async def analysis_run(
+    script_path: str,
+    args: Optional[List[str]] = None,
+    timeout_sec: int = 600,
+    output_dir: str = "",
+) -> Dict[str, Any]:
+    """
+    Runs a Python analysis script and saves stdout/stderr to analysis.log.
+    """
+    log.info(f"Tool Call: analysis_run(script_path='{script_path}', timeout_sec={timeout_sec})")
+    if timeout_sec <= 0:
+        raise ValueError("timeout_sec must be a positive integer.")
+
+    allowed_bases = [USER_HOME, ARTIFACTS_BASE_DIR, Path.cwd()]
+    script_abs = await _resolve_and_validate_path(
+        script_path,
+        allowed_bases=allowed_bases,
+        check_existence=True
+    )
+    if script_abs.suffix.lower() != ".py":
+        raise ValueError("script_path must point to a .py file.")
+
+    output_dir_abs = script_abs.parent
+    if output_dir:
+        output_dir_abs = await _resolve_and_validate_path(
+            output_dir,
+            allowed_bases=allowed_bases,
+            check_existence=False
+        )
+    await _async_file_op(_sync_mkdir, output_dir_abs)
+    log_path = output_dir_abs / "analysis.log"
+
+    if args is None:
+        args_list: List[str] = []
+    elif isinstance(args, list):
+        args_list = [str(item) for item in args]
+    else:
+        raise ValueError("args must be a list of strings.")
+
+    try:
+        return_code, stdout_str, stderr_str = await _run_python_script(
+            script_abs,
+            args_list,
+            timeout_sec,
+            cwd=script_abs.parent
+        )
+    except Exception as e:
+        log.error(f"Analysis run failed: {e}")
+        raise
+
+    log_content = "\n".join([
+        f"cmd: {sys.executable} {script_abs} {' '.join(args_list)}",
+        f"return_code: {return_code}",
+        "stdout:",
+        stdout_str,
+        "stderr:",
+        stderr_str,
+    ])
+    await _async_file_op(_sync_write_file, log_path, log_content)
+
+    ok = return_code == 0
+    return {
+        "ok": ok,
+        "return_code": return_code,
+        "log_path": str(log_path),
+        "stdout_tail": _tail_text(stdout_str),
+        "stderr_tail": _tail_text(stderr_str),
+    }
+
+
+@mcp.tool()
+async def cloud_upload(
+    src_dir: str,
+    provider: str,
+    bucket: str,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    Uploads a directory to an S3-compatible backend.
+    """
+    log.info(f"Tool Call: cloud_upload(src_dir='{src_dir}', provider='{provider}', bucket='{bucket}')")
+    if not src_dir:
+        raise ValueError("src_dir is required.")
+    if not provider:
+        raise ValueError("provider is required.")
+    if not bucket:
+        raise ValueError("bucket is required.")
+
+    provider_lower = provider.lower()
+    if provider_lower != "s3":
+        raise ValueError("Only provider='s3' is supported in v1.0.")
+
+    allowed_bases = [USER_HOME, ARTIFACTS_BASE_DIR, Path.cwd()]
+    src_dir_abs = await _resolve_and_validate_path(
+        src_dir,
+        allowed_bases=allowed_bases,
+        check_existence=True
+    )
+    exists, _, is_dir = await _async_file_op(_sync_check_exists, src_dir_abs)
+    if not exists or not is_dir:
+        raise FileNotFoundError(f"src_dir is not a directory: {src_dir_abs}")
+
+    try:
+        import boto3  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "boto3 is required for cloud_upload. Install with: pip install boto3"
+        ) from e
+
+    files = await _async_file_op(_sync_collect_files, src_dir_abs)
+    if not files:
+        return {"ok": True, "uploaded_count": 0, "prefix": prefix}
+
+    client = boto3.client("s3")
+    uploaded_keys: List[str] = []
+    prefix_clean = prefix.strip("/")
+
+    for filepath in files:
+        rel_path = filepath.relative_to(src_dir_abs).as_posix()
+        key = f"{prefix_clean}/{rel_path}" if prefix_clean else rel_path
+        try:
+            client.upload_file(str(filepath), bucket, key)
+        except Exception as e:
+            log.error(f"S3 upload failed for {filepath}: {e}")
+            raise Exception(f"S3 upload failed for {filepath}: {e}") from e
+        uploaded_keys.append(key)
+
+    return {
+        "ok": True,
+        "uploaded_count": len(uploaded_keys),
+        "prefix": prefix,
+        "uploaded_preview": uploaded_keys[:20],
+    }
+
+
+@mcp.tool()
+async def pipeline_run_and_collect(config_json: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Runs compile -> upload -> run -> export -> analysis -> cloud in one call.
+    """
+    log.info("Tool Call: pipeline_run_and_collect()")
+    if isinstance(config_json, str):
+        try:
+            config = json.loads(config_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON input: {e}") from e
+    elif isinstance(config_json, dict):
+        config = config_json
+    else:
+        raise ValueError("config_json must be a JSON string or dict.")
+
+    run_id_raw = str(config.get("run_id", "auto")).strip()
+    run_id = run_id_raw
+    if not run_id or run_id.lower() == "auto":
+        run_id = await _generate_run_id()
+    else:
+        _validate_run_id(run_id)
+
+    artifact_dir = await _create_artifact_dir(run_id)
+    artifact_dir_str = str(artifact_dir)
+    manifest_path = artifact_dir / "manifest.json"
+    compile_log_path = artifact_dir / "compile.log"
+    upload_log_path = artifact_dir / "upload.log"
+    control_log_path = artifact_dir / "control.log"
+    serial_log_path = artifact_dir / "serial.log"
+
+    steps: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    status = "success"
+    next_action_hint = "none"
+    time_start = datetime.datetime.now().isoformat(timespec="seconds")
+
+    def record_step(name: str, ok: bool, extra: Optional[Dict[str, Any]] = None) -> None:
+        entry = {"name": name, "ok": ok}
+        if extra:
+            entry.update(extra)
+        steps.append(entry)
+
+    manifest: Dict[str, Any] = {
+        "run_id": run_id,
+        "time_start": time_start,
+        "time_end": None,
+        "sketch": None,
+        "board_fqbn": config.get("board_fqbn", ""),
+        "port": config.get("port", ""),
+        "baud": config.get("baud", SERIAL_DEFAULT_BAUD),
+        "export_files": [],
+        "analysis_outputs": [],
+        "cloud_prefix": None,
+        "status": "running",
+        "errors": [],
+        "steps": [],
+    }
+
+    async def finalize_manifest() -> None:
+        manifest["time_end"] = datetime.datetime.now().isoformat(timespec="seconds")
+        manifest["status"] = status
+        manifest["errors"] = errors
+        manifest["steps"] = steps
+
+        analysis_dir = artifact_dir / "analysis"
+        try:
+            analysis_files = await _async_file_op(_sync_collect_files, analysis_dir)
+            manifest["analysis_outputs"] = [
+                str(path.relative_to(artifact_dir)).replace("\\", "/") for path in analysis_files
+            ]
+        except Exception:
+            manifest["analysis_outputs"] = []
+
+        await _async_file_op(_sync_write_file, manifest_path, json.dumps(manifest, indent=2))
+
+    try:
+        sketch_path_cfg = str(config.get("sketch_path", "")).strip()
+        sketch_name = str(config.get("sketch_name", "")).strip()
+        allowed_bases = [SKETCHES_BASE_DIR, USER_HOME, Path.cwd()]
+        if sketch_path_cfg:
+            sketch_path_cfg = _expand_placeholders(sketch_path_cfg, run_id, artifact_dir)
+            sketch_path_abs = await _resolve_and_validate_path(
+                sketch_path_cfg,
+                allowed_bases=allowed_bases,
+                check_existence=True
+            )
+            manifest["sketch"] = str(sketch_path_abs)
+        elif sketch_name:
+            if any(c in sketch_name for c in ['/', '\\']) or ".." in sketch_name:
+                raise ValueError("Invalid sketch_name. Cannot contain path separators or '..'.")
+            sketch_path_abs = (SKETCHES_BASE_DIR / sketch_name).resolve(strict=False)
+            manifest["sketch"] = sketch_name
+        else:
+            raise ValueError("sketch_name or sketch_path is required.")
+
+        exists, _, is_dir = await _async_file_op(_sync_check_exists, sketch_path_abs)
+        if not exists or not is_dir:
+            raise FileNotFoundError(f"Sketch directory not found: {sketch_path_abs}")
+        main_ino_file = sketch_path_abs / f"{sketch_path_abs.name}.ino"
+        ino_exists, is_file, _ = await _async_file_op(_sync_check_exists, main_ino_file)
+        if not ino_exists or not is_file:
+            raise FileNotFoundError(f"Main sketch file not found: {main_ino_file}")
+
+        board_fqbn = str(config.get("board_fqbn", "")).strip()
+        port = str(config.get("port", "")).strip()
+        baud = int(config.get("baud", SERIAL_DEFAULT_BAUD))
+        manifest["board_fqbn"] = board_fqbn
+        manifest["port"] = port
+        manifest["baud"] = baud
+
+        if not board_fqbn:
+            raise ValueError("board_fqbn is required.")
+        if not port:
+            raise ValueError("port is required.")
+        if baud <= 0:
+            raise ValueError("baud must be a positive integer.")
+
+        build_path_abs = (
+            BUILD_TEMP_DIR / f"{sketch_path_abs.name}_pipeline_{run_id}_{board_fqbn.replace(':', '_')}"
+        ).resolve(strict=False)
+
+        # Step: compile
+        try:
+            compile_cmd = [
+                "compile",
+                "--fqbn", board_fqbn,
+                "--verbose",
+                "--build-path", str(build_path_abs),
+                str(sketch_path_abs),
+            ]
+            compile_stdout, compile_stderr, _ = await _run_arduino_cli_command(compile_cmd, check=True)
+            compile_log = "\n".join([compile_stdout, compile_stderr]).strip()
+            await _async_file_op(_sync_write_file, compile_log_path, compile_log)
+            size_info = _parse_compile_output(compile_stdout, compile_stderr)
+            record_step("compile", True, {"details": size_info} if size_info else None)
+        except Exception as e:
+            errors.append(f"compile: {e}")
+            record_step("compile", False)
+            status = "failure"
+            next_action_hint = "none"
+            await finalize_manifest()
+            return {
+                "status": status,
+                "run_id": run_id,
+                "artifact_dir": artifact_dir_str,
+                "steps": steps,
+                "errors": errors,
+                "next_action_hint": next_action_hint,
+            }
+
+        # Step: upload
+        paused_monitors: List[SerialMonitorState] = []
+        try:
+            upload_cmd = [
+                "upload",
+                "--port", port,
+                "--fqbn", board_fqbn,
+                "--verbose",
+                "--build-path", str(build_path_abs),
+                str(sketch_path_abs),
+            ]
+            paused_monitors = await _pause_monitors_for_port(port, force=True, wait_tasks=False)
+            upload_stdout, upload_stderr, _ = await _run_arduino_cli_command(upload_cmd, check=True)
+            upload_log = "\n".join([upload_stdout, upload_stderr]).strip()
+            await _async_file_op(_sync_write_file, upload_log_path, upload_log)
+            record_step("upload", True)
+        except Exception as e:
+            errors.append(f"upload: {e}")
+            record_step("upload", False)
+            status = "failure"
+            next_action_hint = "reupload"
+            if paused_monitors:
+                await _resume_monitors(paused_monitors)
+            await finalize_manifest()
+            return {
+                "status": status,
+                "run_id": run_id,
+                "artifact_dir": artifact_dir_str,
+                "steps": steps,
+                "errors": errors,
+                "next_action_hint": next_action_hint,
+            }
+        finally:
+            if paused_monitors:
+                await _resume_monitors(paused_monitors)
+
+        # Step: run (START -> wait -> STOP)
+        experiment_cfg = config.get("experiment", {}) or {}
+        start_cmd = _expand_placeholders(
+            str(experiment_cfg.get("start_cmd", "START run_id={run_id}")),
+            run_id,
+            artifact_dir,
+        )
+        stop_cmd = _expand_placeholders(
+            str(experiment_cfg.get("stop_cmd", "STOP")),
+            run_id,
+            artifact_dir,
+        )
+        duration_sec = int(experiment_cfg.get("duration_sec", 0))
+        if duration_sec <= 0:
+            raise ValueError("experiment.duration_sec must be > 0.")
+
+        try:
+            await _async_file_op(_sync_serial_write, port, baud, start_cmd, True)
+            await _append_control_log(control_log_path, start_cmd)
+            await asyncio.sleep(duration_sec)
+            await _async_file_op(_sync_serial_write, port, baud, stop_cmd, True)
+            await _append_control_log(control_log_path, stop_cmd)
+            record_step("run", True)
+        except Exception as e:
+            errors.append(f"run: {e}")
+            record_step("run", False)
+            status = "failure"
+            next_action_hint = "check_port"
+            await finalize_manifest()
+            return {
+                "status": status,
+                "run_id": run_id,
+                "artifact_dir": artifact_dir_str,
+                "steps": steps,
+                "errors": errors,
+                "next_action_hint": next_action_hint,
+            }
+
+        # Step: optional serial capture
+        serial_capture_cfg = config.get("serial_capture", {}) or {}
+        if bool(serial_capture_cfg.get("enabled", False)):
+            capture_sec = int(serial_capture_cfg.get("capture_sec", 10))
+            buffer_lines = int(serial_capture_cfg.get("buffer_lines", SERIAL_DEFAULT_BUFFER_LINES))
+            log_to_file = bool(serial_capture_cfg.get("log_to_file", True))
+            log_path = serial_log_path if log_to_file else None
+
+            try:
+                state = await _create_serial_monitor_state(
+                    port=port,
+                    baud=baud,
+                    buffer_lines=buffer_lines,
+                    log_path=log_path,
+                    board_fqbn=board_fqbn or None,
+                    protocol="serial",
+                    auto_reconnect=False,
+                    log_max_bytes=SERIAL_DEFAULT_LOG_MAX_BYTES,
+                    log_rotate_count=SERIAL_DEFAULT_LOG_ROTATE_COUNT,
+                )
+                await asyncio.sleep(max(capture_sec, 1))
+                await _stop_serial_monitor_state(
+                    state,
+                    remove=True,
+                    force=True,
+                    wait_tasks=True,
+                )
+                record_step("serial_capture", True)
+            except Exception as e:
+                errors.append(f"serial_capture: {e}")
+                record_step("serial_capture", False)
+                status = "failure"
+
+        # Step: export
+        export_cfg = config.get("export", {}) or {}
+        if bool(export_cfg.get("enabled", True)):
+            export_cmd = _expand_placeholders(
+                str(export_cfg.get("export_cmd", "EXPORT run_id={run_id}")),
+                run_id,
+                artifact_dir,
+            )
+            timeout_sec = int(export_cfg.get("timeout_sec", 120))
+            try:
+                await _append_control_log(control_log_path, export_cmd)
+                csv_bytes, raw_log = await _async_file_op(
+                    _sync_serial_export_collect,
+                    port,
+                    baud,
+                    export_cmd,
+                    float(timeout_sec),
+                    True,
+                )
+                if raw_log:
+                    await _async_file_op(_sync_append_text, serial_log_path, raw_log + "\n")
+                if not csv_bytes:
+                    raise ValueError("No CSV data received from export.")
+                csv_path = artifact_dir / "sd" / "log.csv"
+                await _async_file_op(_sync_write_binary_file, csv_path, csv_bytes)
+                manifest["export_files"] = ["sd/log.csv"]
+                record_step("export", True, {"files": ["sd/log.csv"]})
+            except Exception as e:
+                errors.append(f"export: {e}")
+                record_step("export", False)
+                status = "failure"
+                next_action_hint = "retry_export"
+                await finalize_manifest()
+                return {
+                    "status": status,
+                    "run_id": run_id,
+                    "artifact_dir": artifact_dir_str,
+                    "steps": steps,
+                    "errors": errors,
+                    "next_action_hint": next_action_hint,
+                }
+
+        # Step: analysis
+        analysis_cfg = config.get("analysis", {}) or {}
+        if bool(analysis_cfg.get("enabled", False)):
+            script_path = _expand_placeholders(
+                str(analysis_cfg.get("script_path", "")),
+                run_id,
+                artifact_dir,
+            )
+            args = analysis_cfg.get("args", [])
+            if isinstance(args, list):
+                args_expanded = [
+                    _expand_placeholders(str(arg), run_id, artifact_dir) for arg in args
+                ]
+            else:
+                raise ValueError("analysis.args must be a list.")
+
+            try:
+                analysis_result = await analysis_run(
+                    script_path=script_path,
+                    args=args_expanded,
+                    timeout_sec=int(analysis_cfg.get("timeout_sec", 600)),
+                    output_dir=artifact_dir_str,
+                )
+                record_step("analysis", bool(analysis_result.get("ok", False)))
+                if not analysis_result.get("ok", False):
+                    status = "failure"
+            except Exception as e:
+                errors.append(f"analysis: {e}")
+                record_step("analysis", False)
+                status = "failure"
+
+        # Step: cloud upload
+        cloud_cfg = config.get("cloud", {}) or {}
+        if bool(cloud_cfg.get("enabled", False)):
+            prefix = _expand_placeholders(
+                str(cloud_cfg.get("prefix", "")),
+                run_id,
+                artifact_dir,
+            )
+            try:
+                upload_result = await cloud_upload(
+                    src_dir=artifact_dir_str,
+                    provider=str(cloud_cfg.get("provider", "s3")),
+                    bucket=str(cloud_cfg.get("bucket", "")),
+                    prefix=prefix,
+                )
+                record_step("cloud", bool(upload_result.get("ok", False)))
+                if upload_result.get("ok", False):
+                    manifest["cloud_prefix"] = prefix
+                else:
+                    status = "failure"
+                    next_action_hint = "reupload"
+            except Exception as e:
+                errors.append(f"cloud: {e}")
+                record_step("cloud", False)
+                status = "failure"
+                next_action_hint = "reupload"
+
+        await finalize_manifest()
+        return {
+            "status": status,
+            "run_id": run_id,
+            "artifact_dir": artifact_dir_str,
+            "steps": steps,
+            "errors": errors,
+            "next_action_hint": next_action_hint,
+        }
+
+    except Exception as e:
+        errors.append(f"pipeline: {e}")
+        status = "failure"
+        next_action_hint = next_action_hint or "none"
+        await finalize_manifest()
+        return {
+            "status": status,
+            "run_id": run_id,
+            "artifact_dir": artifact_dir_str,
+            "steps": steps,
+            "errors": errors,
+            "next_action_hint": next_action_hint,
+        }
 
 
 @mcp.tool()
