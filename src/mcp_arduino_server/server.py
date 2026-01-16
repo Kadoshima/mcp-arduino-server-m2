@@ -325,16 +325,7 @@ ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # ==============================================================================
 # MCP Server Initialization
 # ==============================================================================
-mcp = FastMCP(
-    "Arduino & WireViz Tools", # Updated name
-    description=(
-        "Tools for managing Arduino sketches (create, list, read, write with auto-compile), "
-        "code verification (compile), uploading, libraries (search, install, examples), "
-        "board discovery via arduino-cli, basic file operations, and generating "
-        "circuit diagrams from WireViz YAML." # Updated description
-    ),
-    dependencies=["mcp[cli]", "thefuzz[speedup]", "wireviz"] # Added wireviz dependency info
-)
+mcp = FastMCP("Arduino & WireViz Tools")
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
