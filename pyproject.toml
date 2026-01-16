@@ -34,7 +34,16 @@ dependencies = [
     "thefuzz[speedup]>=0.20.0", # Specify minimum thefuzz version
     "wireviz", # Added WireViz dependency
     "openai", # For GPT-4.1 API calls
-    # Add any other direct dependencies your script might implicitly use
+    "pyserial>=3.5", # Required for serial communication (serial_write, serial_export_collect)
+]
+
+# Optional dependencies for additional features
+[project.optional-dependencies]
+cloud = [
+    "boto3>=1.26.0", # Required for cloud_upload to S3-compatible storage
+]
+all = [
+    "boto3>=1.26.0", # Include all optional dependencies
 ]
 
 # Optional: Define command-line scripts

@@ -147,7 +147,9 @@ except ImportError:
 # Configuration & Constants
 # ==============================================================================
 USER_HOME: Path = Path.home()
-SKETCHES_BASE_DIR: Path = USER_HOME / "Documents" / "Arduino_MCP_Sketches"
+SKETCHES_BASE_DIR: Path = Path(
+    os.environ.get("MCP_SKETCH_DIR", str(USER_HOME / "Documents" / "Arduino_MCP_Sketches"))
+).expanduser()
 BUILD_TEMP_DIR: Path = SKETCHES_BASE_DIR / "_build_temp"
 ARTIFACTS_BASE_DIR: Path = Path(
     os.environ.get("MCP_ARTIFACTS_DIR", str(Path.cwd() / "artifacts"))
@@ -1675,6 +1677,167 @@ async def list_boards() -> str:
 
 
 @mcp.tool()
+async def auto_detect_port(prefer_fqbn: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Automatically detects the first connected Arduino/ESP32 board and returns its port.
+
+    This tool is useful for Windows users who don't want to manually specify COM port numbers.
+    It wraps 'arduino-cli board list' and returns the port of the first detected board.
+
+    Args:
+        prefer_fqbn: Optional FQBN pattern to prefer (e.g., "esp32:esp32:esp32").
+                     If specified, tries to find a board matching this FQBN first.
+
+    Returns:
+        Dict with:
+            - port: The detected port (e.g., "COM7" or "/dev/ttyUSB0")
+            - board_name: The board name (e.g., "ESP32 Dev Module")
+            - fqbn: The board's fully qualified board name
+            - status: "success" or "failure"
+            - error: Error message if detection failed
+
+    Example:
+        >>> result = await auto_detect_port()
+        >>> print(result["port"])
+        COM7
+
+        >>> result = await auto_detect_port(prefer_fqbn="esp32:esp32:esp32")
+        >>> print(result["port"])
+        COM7
+
+    Notes:
+        - Returns the first board if no preference is specified
+        - If prefer_fqbn is specified but not found, falls back to first board
+        - Requires at least one board to be connected
+        - On Windows, COM ports are typically COM1, COM3, COM7, etc.
+        - On Linux, ports are typically /dev/ttyUSB0, /dev/ttyACM0, etc.
+    """
+    log.info(f"Tool Call: auto_detect_port(prefer_fqbn={prefer_fqbn})")
+
+    try:
+        board_list_cmd_args = ["board", "list", "--format", "json"]
+        board_list_json, board_list_stderr, board_list_retcode = await _run_arduino_cli_command(
+            board_list_cmd_args, check=False
+        )
+
+        # Handle empty or error cases
+        if board_list_retcode != 0 or not board_list_json.strip():
+            return {
+                "status": "failure",
+                "port": "",
+                "board_name": "",
+                "fqbn": "",
+                "error": "No boards detected. Please connect an Arduino/ESP32 board.",
+            }
+
+        combined_output_lower = (board_list_json + board_list_stderr).lower()
+        if "no boards found" in combined_output_lower or "could not find any board" in combined_output_lower:
+            return {
+                "status": "failure",
+                "port": "",
+                "board_name": "",
+                "fqbn": "",
+                "error": "No boards detected. Please connect an Arduino/ESP32 board.",
+            }
+
+        # Parse JSON (handle both old and new arduino-cli formats)
+        boards_data = json.loads(board_list_json)
+
+        # Handle different JSON formats based on type
+        detected_ports = []
+        if isinstance(boards_data, dict):
+            # New format (arduino-cli 0.20+): {"detected_ports": [...]}
+            detected_ports = boards_data.get("detected_ports", [])
+            # Alternative dict format: {"boards": [...]}
+            if not detected_ports:
+                detected_ports = boards_data.get("boards", [])
+        elif isinstance(boards_data, list):
+            # Very old format: direct array
+            detected_ports = boards_data
+        else:
+            # Unknown format
+            log.warning(f"Unexpected arduino-cli JSON format: {type(boards_data)}")
+
+        if not detected_ports:
+            return {
+                "status": "failure",
+                "port": "",
+                "board_name": "",
+                "fqbn": "",
+                "error": "No boards with recognized ports detected.",
+            }
+
+        # Find preferred board if specified
+        preferred_board = None
+        if prefer_fqbn:
+            for port_entry in detected_ports:
+                matching_boards = port_entry.get("matching_boards", [])
+                for board in matching_boards:
+                    board_fqbn = board.get("fqbn", "")
+                    if prefer_fqbn.lower() in board_fqbn.lower():
+                        preferred_board = {
+                            "port": port_entry.get("port", {}).get("address", ""),
+                            "board_name": board.get("name", "Unknown Board"),
+                            "fqbn": board_fqbn,
+                        }
+                        break
+                if preferred_board:
+                    break
+
+        # Use preferred board or fall back to first board
+        if preferred_board:
+            result_board = preferred_board
+        else:
+            # Use first detected port
+            first_port_entry = detected_ports[0]
+            port_address = first_port_entry.get("port", {}).get("address", "")
+            matching_boards = first_port_entry.get("matching_boards", [])
+
+            if matching_boards:
+                first_board = matching_boards[0]
+                board_name = first_board.get("name", "Unknown Board")
+                board_fqbn = first_board.get("fqbn", "")
+            else:
+                board_name = "Unknown Board"
+                board_fqbn = ""
+
+            result_board = {
+                "port": port_address,
+                "board_name": board_name,
+                "fqbn": board_fqbn,
+            }
+
+        if not result_board["port"]:
+            return {
+                "status": "failure",
+                "port": "",
+                "board_name": "",
+                "fqbn": "",
+                "error": "Detected board but could not determine port address.",
+            }
+
+        log.info(f"Auto-detected port: {result_board['port']} ({result_board['board_name']})")
+
+        return {
+            "status": "success",
+            "port": result_board["port"],
+            "board_name": result_board["board_name"],
+            "fqbn": result_board["fqbn"],
+            "error": "",
+        }
+
+    except Exception as e:
+        log.exception("Error during auto_detect_port execution.")
+        return {
+            "status": "failure",
+            "port": "",
+            "board_name": "",
+            "fqbn": "",
+            "error": f"Port detection failed: {type(e).__name__}: {e}",
+        }
+
+
+@mcp.tool()
 async def serial_monitor_start(
     port: str,
     baud: int = SERIAL_DEFAULT_BAUD,
@@ -1891,6 +2054,133 @@ async def serial_request_export(
     export_cmd = f"EXPORT run_id={safe_run_id}"
     result = await serial_write(port=port, baud=baud, data=export_cmd, append_newline=True)
     return {"ok": result.get("ok", True), "hint": "monitor_read_next"}
+
+
+@mcp.tool()
+async def serial_export_collect(
+    run_id: str,
+    port: str,
+    baud: int = SERIAL_DEFAULT_BAUD,
+    timeout_sec: int = 120,
+) -> Dict[str, Any]:
+    """
+    Sends EXPORT command, collects SD log data over serial, and saves to artifact directory.
+
+    This tool combines serial_request_export with data collection, making it useful for
+    retrying failed exports without re-running the entire pipeline.
+
+    Args:
+        run_id: The run ID to export (must match the run ID used during experiment)
+        port: Serial port (e.g., "COM7" or "/dev/ttyUSB0")
+        baud: Baud rate (default: 115200)
+        timeout_sec: Timeout for export in seconds (default: 120)
+
+    Returns:
+        Dict with:
+            - status: "success" or "failure"
+            - run_id: The run ID
+            - artifact_dir: Path to artifact directory
+            - csv_path: Relative path to saved CSV file (e.g., "sd/log.csv")
+            - bytes_received: Number of bytes received
+            - errors: List of error messages (if any)
+
+    Raises:
+        ValueError: If run_id is invalid or artifact directory doesn't exist
+        RuntimeError: If export fails or times out
+
+    Example:
+        >>> result = await serial_export_collect(
+        ...     run_id="20260116_120000_run001",
+        ...     port="COM7",
+        ...     baud=115200,
+        ...     timeout_sec=120
+        ... )
+        >>> print(result["status"])
+        success
+
+    Notes:
+        - The artifact directory for the run_id must already exist (created by pipeline or manually)
+        - The device must be in idle state (experiment stopped) before export
+        - Export can be retried multiple times without re-running the experiment
+        - Progress is logged to control.log in the artifact directory
+    """
+    log.info(f"Tool Call: serial_export_collect(run_id='{run_id}', port='{port}', baud={baud}, timeout={timeout_sec})")
+
+    errors = []
+
+    try:
+        # Validate run_id
+        safe_run_id = _validate_run_id(run_id)
+
+        # Ensure artifact directory exists
+        artifact_base = await _ensure_artifacts_base_dir()
+        artifact_dir = artifact_base / safe_run_id
+
+        exists, _, is_dir = await _async_file_op(_sync_check_exists, artifact_dir)
+        if not exists:
+            raise ValueError(
+                f"Artifact directory does not exist: {artifact_dir}\n"
+                f"Create it first using pipeline_run_and_collect or manually create the directory."
+            )
+        if not is_dir:
+            raise ValueError(f"Path exists but is not a directory: {artifact_dir}")
+
+        control_log_path = artifact_dir / "control.log"
+        serial_log_path = artifact_dir / "serial.log"
+
+        # Send EXPORT command and collect data
+        export_cmd = f"EXPORT run_id={safe_run_id}"
+        await _append_control_log(control_log_path, export_cmd)
+
+        csv_bytes, raw_log = await _async_file_op(
+            _sync_serial_export_collect,
+            port,
+            baud,
+            export_cmd,
+            float(timeout_sec),
+            True,  # append_newline
+        )
+
+        # Save raw serial log
+        if raw_log:
+            await _async_file_op(_sync_append_text, serial_log_path, raw_log + "\n")
+
+        # Validate received data
+        if not csv_bytes:
+            raise ValueError("No CSV data received from export. Device may not have responded.")
+
+        # Save CSV to sd/log.csv
+        csv_dir = artifact_dir / "sd"
+        await _async_file_op(_sync_mkdir, csv_dir)
+        csv_path = csv_dir / "log.csv"
+        await _async_file_op(_sync_write_binary_file, csv_path, csv_bytes)
+
+        csv_rel_path = str(csv_path.relative_to(artifact_dir)).replace("\\", "/")
+
+        log.info(f"Successfully exported {len(csv_bytes)} bytes to {csv_path}")
+
+        return {
+            "status": "success",
+            "run_id": safe_run_id,
+            "artifact_dir": str(artifact_dir),
+            "csv_path": csv_rel_path,
+            "bytes_received": len(csv_bytes),
+            "errors": [],
+        }
+
+    except Exception as e:
+        error_msg = f"Export failed: {e}"
+        errors.append(error_msg)
+        log.error(error_msg)
+
+        return {
+            "status": "failure",
+            "run_id": run_id,
+            "artifact_dir": str(artifact_dir) if 'artifact_dir' in locals() else "",
+            "csv_path": "",
+            "bytes_received": 0,
+            "errors": errors,
+        }
 
 
 @mcp.tool()

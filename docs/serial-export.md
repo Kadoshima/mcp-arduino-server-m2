@@ -44,9 +44,27 @@ EXPORT run_id=20260115_2112_run001
 ```
 
 ## Export Framing
-The export stream must have a deterministic end. Recommended options:
-- `BEGIN` / `END` markers around CSV content, or
-- a size-prefixed header (`SIZE=12345`) followed by raw bytes.
+The export stream must have a deterministic end. Two modes are supported:
+
+### Binary Mode (SIZE= prefix - recommended)
+```
+SIZE=12345\n
+[exactly 12345 bytes of raw CSV data]
+```
+- More reliable for large files and binary-safe
+- PC reads exactly the specified number of bytes
+- **CRITICAL**: Do NOT send `BEGIN`/`END` after `SIZE=` - they will corrupt the CSV data
+
+### Text Mode (BEGIN/END markers - fallback)
+```
+BEGIN\n
+[CSV data line by line]\nEND\n
+```
+- Used when SIZE= is not available or for debugging
+- PC collects lines between BEGIN and END markers
+- Less efficient for large files
+
+**Important**: These modes are mutually exclusive. If `SIZE=` is sent, BEGIN/END must NOT be sent.
 
 The PC side should not assume idle time is a reliable end condition.
 
